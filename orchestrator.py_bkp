@@ -1,0 +1,91 @@
+import os
+import pandas as pd
+from datetime import datetime
+from engine.utils import load_config, load_universe
+from engine.datafeed import add_indicators, candles_to_df
+from selector.auto_selector import (
+    score_intraday, score_swing,
+    pick_preferred_intraday_interval,
+    llm_rerank, build_trade_plan
+)
+from selector.dynamic_mode import choose_mode_dynamic
+from engine.risk import position_size
+from engine.broker_angel import AngelBroker
+from tools import fetch_instruments  # optional update instruments
+from paper_trade import execute_paper_trades  # refactored from paper_trade.py
+
+# --- CONFIG ---
+cfg = load_config()
+backtest_mode = cfg["run"].get("backtest", False)
+now = datetime.now()
+
+# --- STEP 0: Update instruments if needed ---
+# fetch_instruments.fetch_and_export()  # uncomment if instrument CSV needs refresh
+
+# --- STEP 1: Load universe and broker ---
+universe = load_universe(cfg["run"]["universe_csv"])
+broker = AngelBroker.get_instance(
+    cfg["broker"]["api_key"],
+    cfg["broker"]["client_id"],
+    cfg["broker"]["password"],
+    cfg["broker"]["totp_secret"],
+)
+
+# --- STEP 2: Generate Trade Plans ---
+from run_scan import fetch_history_for_interval  # reuse existing function
+
+# --- Dynamic Mode Selection ---
+index_symbols = [s for s in universe if s.get("is_index", False)]
+if index_symbols:
+    index_sym = index_symbols[0]
+    index_df = fetch_history_for_interval(index_sym, "FIFTEEN_MINUTE", cfg, broker, backtest=backtest_mode)
+    if not index_df.empty:
+        index_df = add_indicators(index_df,
+                                  fast=cfg["strategy"]["fast"],
+                                  slow=cfg["strategy"]["slow"],
+                                  atr_period=cfg["strategy"]["atr_period"])
+    mode = choose_mode_dynamic(index_df)
+else:
+    from selector.auto_selector import choose_mode_now
+    mode = choose_mode_now(now)
+
+print(f"Mode dynamically selected: {mode.upper()} at {now}, backtest={backtest_mode}")
+
+scored = []
+for sym in universe:
+    if mode == "intraday":
+        df5 = fetch_history_for_interval(sym, "FIVE_MINUTE", cfg, broker, backtest=backtest_mode)
+        df15 = fetch_history_for_interval(sym, "FIFTEEN_MINUTE", cfg, broker, backtest=backtest_mode)
+        if df5 is not None and not df5.empty:
+            df5 = add_indicators(df5, fast=cfg["strategy"]["fast"], slow=cfg["strategy"]["slow"], atr_period=cfg["strategy"]["atr_period"])
+        if df15 is not None and not df15.empty:
+            df15 = add_indicators(df15, fast=cfg["strategy"]["fast"], slow=cfg["strategy"]["slow"], atr_period=cfg["strategy"]["atr_period"])
+        pref_interval = pick_preferred_intraday_interval(df5, df15, cfg["scan"])
+        df = df5 if pref_interval == "FIVE_MINUTE" else df15
+        score = score_intraday(df) if not df.empty else -1e9
+    else:  # swing
+        df = fetch_history_for_interval(sym, "ONE_DAY", cfg, broker, backtest=backtest_mode)
+        if df is not None and not df.empty:
+            df = add_indicators(df, fast=cfg["strategy"]["fast"], slow=cfg["strategy"]["slow"], atr_period=cfg["strategy"]["atr_period"])
+        score = score_swing(df) if not df.empty else -1e9
+        pref_interval = "ONE_DAY"
+
+    if df is not None and not df.empty:
+        scored.append((sym, float(score), pref_interval, df))
+
+# --- Sort top trades ---
+top_n = cfg["scan"]["intraday_top_n"] if mode == "intraday" else cfg["scan"]["swing_top_n"]
+scored.sort(key=lambda x: x[1], reverse=True)
+top = scored[:top_n]
+
+# Optional LLM rerank
+top_symbols = llm_rerank([(s, sc) for s, sc, _, _ in top], prompt_context=f"mode={mode}", cfg=cfg["llm"])
+print("Top symbols selected:", [t[0] for t in top])
+
+# --- STEP 3: Execute Paper Trades ---
+paper_trade_log = execute_paper_trades(top, cfg, broker, now, mode)
+
+# --- STEP 4: Optionally Launch Streamlit Dashboard ---
+# os.system("streamlit run dashboard.py")  # uncomment to launch dashboard
+
+print("Orchestrator run complete.")

@@ -5,6 +5,15 @@ requests
 pydantic
 toml
 apscheduler
+logzero
+websocket-client
+pycryptodome
+pyotp
+dotenv
+ta
+streamlit
+matplotlib
+
 # Angel One SmartAPI (install the latest stable version)
 smartapi-python
 # Optional LLM integration (uncomment one of these based on what you use)

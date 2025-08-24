@@ -1,0 +1,35 @@
+# tools/fetch_instruments.py
+import pandas as pd
+import os
+import requests
+
+ANGEL_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+
+def fetch_and_export(out_path: str = "data/instruments.csv"):
+    """
+    Fetch Angel One instrument dump (JSON), extract tradingsymbol and symboltoken,
+    and save to CSV for algo use.
+    """
+    print("📥 Fetching instrument dump from Angel One...")
+    resp = requests.get(ANGEL_URL, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Convert JSON list → DataFrame
+    df = pd.DataFrame(data)
+
+    # Ensure required fields exist
+    if not {"symbol", "token"}.issubset(df.columns):
+        raise ValueError(f"Unexpected columns in Angel dump: {df.columns}")
+
+    # Keep only tradingsymbol + token
+    df_out = df[["symbol", "token"]].rename(
+        columns={"symbol": "tradingsymbol", "token": "symboltoken"}
+    )
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    df_out.to_csv(out_path, index=False)
+    print(f"✅ Exported {len(df_out)} symbols to {out_path}")
+
+if __name__ == "__main__":
+    fetch_and_export()

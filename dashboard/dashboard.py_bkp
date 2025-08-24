@@ -1,0 +1,39 @@
+import os
+import pandas as pd
+import streamlit as st
+from datetime import datetime
+
+PAPER_TRADE_DIR="/Users/pradeep/Documents/algo/v1/algot/data/paper_trades"
+
+def load_latest_trades():
+    files = [f for f in os.listdir(PAPER_TRADE_DIR) if f.endswith(".csv")]
+    if not files:
+        return pd.DataFrame()
+    files.sort(reverse=True)
+    return pd.read_csv(os.path.join(PAPER_TRADE_DIR, files[0]), parse_dates=["hit_time"])
+
+st.title("📊 Algo Paper Trading Dashboard")
+st.write("Monitoring trades, P&L, and performance metrics")
+
+df = load_latest_trades()
+if df.empty:
+    st.warning("No paper trade data found!")
+else:
+    st.subheader("Open Trades / Results")
+    st.dataframe(df)
+
+    st.subheader("Metrics")
+    total = len(df)
+    wins = len(df[df["status"]=="Target Hit"])
+    losses = len(df[df["status"]=="SL Hit"])
+    win_rate = wins/total*100 if total else 0
+    avg_pnl = df["pnl"].mean() if total else 0
+    st.metric("Total Trades", total)
+    st.metric("Win Rate %", f"{win_rate:.2f}")
+    st.metric("Avg P&L", f"{avg_pnl:.2f}")
+
+    st.subheader("Top Winners / Losers")
+    st.write("Top 5 Winning Trades")
+    st.dataframe(df.sort_values("pnl", ascending=False).head(5))
+    st.write("Top 5 Losing Trades")
+    st.dataframe(df.sort_values("pnl").head(5))

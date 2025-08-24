@@ -1,0 +1,186 @@
+from typing import Dict, List, Optional
+import random
+import os
+import pandas as pd
+from pydantic import BaseModel
+import time
+
+# Angel One SmartAPI imports
+try:
+    from SmartApi import SmartConnect  # pip install smartapi-python
+except Exception:
+    SmartConnect = None  # fallback if not installed
+
+
+class Order(BaseModel):
+    symbol: str
+    qty: int
+    side: str                # "BUY" or "SELL"
+    order_type: str = "MARKET"  # MARKET/LIMIT
+    limit_price: Optional[float] = None
+    variety: str = "NORMAL"     # NORMAL, AMO, STOPLOSS, etc.
+    product: str = "INTRADAY"   # INTRADAY or DELIVERY
+    exchange: str = "NSE"
+
+
+class AngelBroker:
+    """Thin wrapper over Angel One SmartAPI.
+    - Handles login
+    - Loads instruments.csv for symboltoken lookup
+    - Singleton instance to avoid repeated logins
+    """
+
+    _singleton = None  # for session reuse
+
+    def __init__(self, api_key: str, client_code: str, password: str, totp_secret: str):
+        assert SmartConnect is not None, "Install smartapi-python first."
+        self.api_key = api_key
+        self.client_code = client_code
+        self.password = password
+        self.totp_secret = totp_secret
+        self.instruments_path = "data/instruments.csv"
+        self._instrument_df: Optional[pd.DataFrame] = None
+
+        self.sc = SmartConnect(api_key=self.api_key)
+        self._login()
+
+    @classmethod
+    def get_instance(cls, api_key: str, client_code: str, password: str, totp_secret: str):
+        """Return a singleton instance (reuse login session)."""
+        if cls._singleton is None:
+            cls._singleton = AngelBroker(api_key, client_code, password, totp_secret)
+        return cls._singleton
+
+    def _login(self, max_retries: int = 5):
+      """
+      Login to AngelOne using client_code, password, and TOTP.
+      Retries on temporary API errors or rate-limit failures.
+      """
+      try:
+        import pyotp
+      except Exception:
+        raise RuntimeError("Please install pyotp for TOTP: pip install pyotp")
+
+      attempt = 0
+      while attempt < max_retries:
+        try:
+            totp = pyotp.TOTP(self.totp_secret).now()
+            data = self.sc.generateSession(self.client_code, self.password, totp)
+            self.feed_token = self.sc.getfeedToken()
+            self.refresh_token = data.get("data", {}).get("refreshToken")
+            print(f"Login successful for {self.client_code}")
+            return
+        except Exception as e:
+            wait_time = (2 ** attempt) * 5 + random.uniform(0, 1)  # exponential backoff
+            print(f"Login attempt {attempt+1} failed: {e}. Retrying in {wait_time:.1f}s...")
+            print(wait_time)
+            time.sleep(5)
+            time.sleep(wait_time)
+            attempt += 1
+
+      raise RuntimeError(f"Failed to login after {max_retries} attempts. Check credentials or rate limits.")
+
+#    def _login(self):
+#        """Login with TOTP"""
+#        import pyotp
+#        totp = pyotp.TOTP(self.totp_secret).now()
+#        data = self.sc.generateSession(self.client_code, self.password, totp)
+#        if "data" not in data:
+#            raise RuntimeError(f"Login failed: {data}")
+#        self.feed_token = self.sc.getfeedToken()
+#        self.refresh_token = data.get("data", {}).get("refreshToken")
+
+    # ---------------- Symbol / Instrument Handling ---------------- #
+
+    def _load_instruments(self) -> pd.DataFrame:
+        """Lazy load instruments CSV into memory"""
+        if self._instrument_df is None:
+            if not os.path.exists(self.instruments_path):
+                raise FileNotFoundError(
+                    f"Instrument file not found: {self.instruments_path}. "
+                    "Run tools/fetch_instruments.py first."
+                )
+            df = pd.read_csv(self.instruments_path)
+            df["tradingsymbol"] = df["tradingsymbol"].astype(str).str.strip().str.upper()
+            self._instrument_df = df
+        return self._instrument_df
+
+    def _normalize(self, symbol: str) -> str:
+        """Remove common AngelOne suffixes (-EQ, -BE, etc.)"""
+        s = symbol.strip().upper()
+        for suffix in ["-EQ", "-BE", "-BZ", "-SM"]:
+            if s.endswith(suffix):
+                return s.replace(suffix, "")
+        return s
+
+    def _symbol_token(self, tradingsymbol: str) -> str:
+        """Lookup token for a trading symbol (exact + fuzzy match)."""
+        df = self._load_instruments()
+        sym = tradingsymbol.strip().upper()
+
+        # 1. Exact match
+        match = df.loc[df["tradingsymbol"] == sym, "symboltoken"]
+        if not match.empty:
+            return str(match.iloc[0])
+
+        # 2. Normalized suffix match
+        sym_norm = self._normalize(sym)
+        df_norm = df.copy()
+        df_norm["norm"] = df_norm["tradingsymbol"].apply(self._normalize)
+        match = df_norm.loc[df_norm["norm"] == sym_norm, "symboltoken"]
+
+        if not match.empty:
+            return str(match.iloc[0])
+
+        raise KeyError(
+            f"Symbol {tradingsymbol} not found in instruments.csv. "
+            "Run tools/fetch_instruments.py to refresh."
+        )
+
+    # ---------------- API Methods ---------------- #
+
+    def get_profile(self) -> Dict:
+        return self.sc.getProfile()
+
+    def quote_ltp(self, exchange: str, tradingsymbol: str) -> float:
+        q = self.sc.ltpData(
+            exchange=exchange,
+            tradingsymbol=tradingsymbol,
+            symboltoken=self._symbol_token(tradingsymbol),
+        )
+        return float(q["data"]["ltp"])
+
+    def historical_candles(self, exchange: str, symbol: str, interval: str, from_dt: str, to_dt: str) -> List[List]:
+        """Fetch OHLCV candles"""
+        token = self._symbol_token(symbol)
+        data = self.sc.getCandleData({
+            "exchange": exchange,
+            "symboltoken": token,
+            "interval": interval,
+            "fromdate": from_dt,
+            "todate": to_dt
+        })
+        return data.get("data", [])
+
+    def place_order(self, order: Order) -> str:
+        params = dict(
+            variety=order.variety,
+            tradingsymbol=order.symbol,
+            symboltoken=self._symbol_token(order.symbol),
+            transactiontype="BUY" if order.side.upper().startswith("B") else "SELL",
+            exchange=order.exchange,
+            ordertype=order.order_type,
+            producttype=order.product,
+            duration="DAY",
+            quantity=int(order.qty),
+        )
+        if order.order_type == "LIMIT" and order.limit_price:
+            params["price"] = float(order.limit_price)
+
+        resp = self.sc.placeOrder(params)
+        if resp.get("status") and resp.get("data"):
+            return str(resp["data"]["orderid"])
+        raise RuntimeError(f"Order failed: {resp}")
+
+    def positions(self):
+        return self.sc.position()

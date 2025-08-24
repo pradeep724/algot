@@ -1,0 +1,2 @@
+symbol,price,stop_price,target_price,stop_dist,rr,qty,interval,score,timestamp
+"{'tradingsymbol': 'Nifty 50', 'symboltoken': 99926000}",24870.1,24468.22692774574,25673.846144508516,401.8730722542579,2.0,6,ONE_DAY,12.433848320264248,2025-08-24 19:55
