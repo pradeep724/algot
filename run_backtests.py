@@ -144,7 +144,7 @@ def main():
         if trades and len(trades) > 0:
             try:
                 df_trades = pd.DataFrame(trades)
-                filename = f"backtest_results_{instrument}.csv"
+                filename = f"results/backtest_results_{instrument}.csv"
                 df_trades.to_csv(filename, index=False)
                 logger.info(f"✅ SAVED: {filename} with {len(trades)} trades")
                 logger.info(f"File size: {os.path.getsize(filename)} bytes")
