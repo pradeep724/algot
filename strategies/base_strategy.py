@@ -17,7 +17,7 @@ class BaseStrategy(ABC):
         """Calculate position size. Must be implemented by subclasses."""
         pass
 
-    def _calculate_technical_indicators(self, df):
+    def _calculate_technical_indicators_test(self, df):
         try:
             df['sma_20'] = df['Close'].rolling(window=20).mean()
             df['sma_50'] = df['Close'].rolling(window=50).mean()
@@ -43,4 +43,23 @@ class BaseStrategy(ABC):
         low_close_prev = np.abs(df['Low'] - df['Close'].shift(1))
         tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
         atr = tr.rolling(window=period).mean()
-        return atr.fillna(method='bfill')
+        return atr.bfill()  # Fixed deprecation warning
+
+    def _calculate_technical_indicators(self, df):
+      try:
+        df['sma_20'] = df['Close'].rolling(window=20).mean()
+        df['sma_50'] = df['Close'].rolling(window=50).mean()
+        df['rsi'] = self._calculate_rsi(df['Close'], self.config['indicators']['rsi_period'])
+        
+        # Handle volume_avg calculation with error handling
+        volume_window = self.config['indicators'].get('volume_avg', 20)
+        df['volume_avg'] = df['Volume'].rolling(window=volume_window).mean()
+        
+        # Fill NaN values in volume_avg
+        df['volume_avg'] = df['volume_avg'].fillna(df['Volume'].mean())
+        
+        df['atr'] = self._calculate_atr(df, self.config['indicators']['atr_period'])
+        return df
+      except Exception as e:
+        log.error(f"Error calculating indicators: {e}")
+        return df
