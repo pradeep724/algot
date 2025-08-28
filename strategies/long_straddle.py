@@ -1,5 +1,6 @@
 from strategies.base_strategy import BaseStrategy
 from utils.logger import log
+import os
 
 class LongStraddleStrategy(BaseStrategy):
     def __init__(self, config):
@@ -101,3 +102,126 @@ class LongStraddleStrategy(BaseStrategy):
             'max_risk': adjusted_risk,
             'suggested_lots': suggested_lots
         }
+
+
+# MODIFY your existing generate method:
+    def generate_signal(self, historical_data, live_data):
+        """Enhanced with instrument-specific volatility logic"""
+        
+        instrument = os.environ.get('CURRENT_INSTRUMENT', 'NIFTY')
+        
+        try:
+            if len(historical_data) < 30:
+                return None
+    
+            df = self._calculate_technical_indicators(historical_data.copy())
+            latest = df.iloc[-1]
+    
+            # Apply instrument filters
+            filters_passed, filter_reason = self.apply_instrument_filters(df, latest, live_data, instrument)
+            if not filters_passed:
+                return None
+    
+            params = self.get_instrument_parameters(instrument)
+    
+            # Instrument-specific volatility strategy
+            if instrument == 'FINNIFTY':
+                # For FINNIFTY, use volatility-based approach
+                return self._generate_finnifty_volatility_signal(df, latest, live_data, params)
+            elif instrument == 'BANKNIFTY':
+                # For BANKNIFTY, be much more selective
+                return self._generate_banknifty_selective_signal(df, latest, live_data, params)
+            else:
+                # Standard approach for NIFTY and MIDCPNIFTY
+                return self._generate_standard_straddle_signal(df, latest, live_data, params, instrument)
+    
+        except Exception as e:
+            log.error(f"Error in LongStraddleStrategy for {instrument}: {e}")
+            return None
+    
+    def _generate_finnifty_volatility_signal(self, df, latest, live_data, params):
+        """FINNIFTY-specific volatility strategy"""
+        vix = live_data.get('vix', {}).get('value', 15)
+        
+        # Only trade FINNIFTY straddles when volatility is cheap (VIX < 15)
+        if vix >= params.get('vix_low_threshold', 15):
+            return None
+        
+        # Look for tight consolidation before breakout
+        lookback = 5
+        recent_high = df['High'].tail(lookback).max()
+        recent_low = df['Low'].tail(lookback).min()
+        range_pct = (recent_high - recent_low) / latest['Close']
+        
+        if range_pct > 0.015:  # Must be very tight (1.5%)
+            return None
+            
+        return {
+            'direction': 'long_vol',
+            'strategy_type': 'FinniftyVolatilityStraddle',
+            'confidence': 65,
+            'spot_price': latest['Close'],
+            'vix_at_entry': vix,
+            'reason': 'Low vol environment with tight consolidation'
+        }
+    
+    def _generate_banknifty_selective_signal(self, df, latest, live_data, params):
+        """BANKNIFTY-specific selective approach"""
+        vix = live_data.get('vix', {}).get('value', 15)
+        
+        # For BANKNIFTY, only trade when VIX is very high (premium rich)
+        if vix < 20:
+            return None
+            
+        # Require very tight consolidation
+        lookback = 8
+        recent_high = df['High'].tail(lookback).max()
+        recent_low = df['Low'].tail(lookback).min()
+        range_pct = (recent_high - recent_low) / latest['Close']
+        
+        if range_pct > 0.02:  # Very tight requirement
+            return None
+            
+        # Additional volume filter
+        if latest['Volume'] < df['Volume'].tail(20).mean() * 2.0:
+            return None
+            
+        return {
+            'direction': 'long_vol',
+            'strategy_type': 'BankNiftySelectiveStraddle', 
+            'confidence': 75,
+            'spot_price': latest['Close'],
+            'vix_at_entry': vix,
+            'reason': 'High VIX with very tight consolidation'
+        }
+    
+    def _generate_standard_straddle_signal(self, df, latest, live_data, params, instrument):
+        """Standard straddle logic for NIFTY and MIDCPNIFTY"""
+        vix = live_data.get('vix', {}).get('value', 15)
+        
+        if vix > params.get('vix_threshold', 20):
+            return None
+    
+        if not self._detect_consolidation_breakout(df, latest):
+            return None
+    
+        if not self._confirm_volume_breakout(df, latest):
+            return None
+    
+        confidence = self._calculate_confidence(df, latest, vix)
+        
+        # Adjust confidence based on instrument performance
+        if instrument == 'NIFTY':
+            confidence += 5  # Working better
+        elif instrument == 'MIDCPNIFTY':
+            confidence *= 0.9  # Slightly less confident
+    
+        return {
+            'direction': 'long_vol',
+            'strategy_type': 'LongStraddle',
+            'confidence': confidence,
+            'spot_price': latest['Close'],
+            'entry_time': latest.name,
+            'max_dte': params.get('max_dte', 30)
+        }
+

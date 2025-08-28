@@ -8,9 +8,8 @@ st.set_page_config(page_title="ProTraderBot Dashboard", page_icon="📈", layout
 
 def load_data():
     data = {}
-    instruments = ["BANKNIFTY","FINNIFTY","MIDCPNIFTY","NIFTYNXT50","NIFTY"]
-    for instrument in instruments:
-        csv_file = "backtest_results_" + instrument + "_fixed.csv"
+    for instrument in ["NIFTY", "BANKNIFTY"]:
+        csv_file = "backtest_results_" + instrument + ".csv"
         csv_file = f"results/{csv_file}"
         if os.path.exists(csv_file):
             try:

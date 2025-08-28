@@ -1,5 +1,7 @@
 data_fetcher.log
 config.yaml
+config.yaml_fake
 backtester.log
 logs
 results
+data
