@@ -1,1 +1,4 @@
-config/secrets.toml
+data_fetcher.log
+config.yaml
+backtester.log
+logs
