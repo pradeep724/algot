@@ -10,7 +10,8 @@ def load_data():
     data = {}
     instruments = ["BANKNIFTY","FINNIFTY","MIDCPNIFTY","NIFTYNXT50","NIFTY"]
     for instrument in instruments:
-        csv_file = "backtest_results_" + instrument + "_fixed.csv"
+        #csv_file = "backtest_results_" + instrument + "_fixed.csv"
+        csv_file = "backtest_" + instrument + "_trades.csv"
         csv_file = f"results/{csv_file}"
         if os.path.exists(csv_file):
             try:
