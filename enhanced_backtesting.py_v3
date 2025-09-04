@@ -1,0 +1,439 @@
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import importlib
+import sys
+
+
+# ---------------- Data Structures ---------------- #
+
+@dataclass
+class TradingSignal:
+    timestamp: datetime
+    symbol: str
+    strategy: str
+    signal_type: str  # 'BUY' or 'SELL'
+    strength: float
+    entry_price: float
+    target_price: float
+    stop_loss: float
+    position_size: int
+    expected_pnl: float
+    risk_reward_ratio: float
+    confidence: float
+    market_regime: str
+    reasons: str
+
+
+@dataclass
+class Trade:
+    signal: TradingSignal
+    entry_time: datetime
+    entry_price: float
+    exit_time: Optional[datetime] = None
+    exit_price: Optional[float] = None
+    exit_reason: str = ""
+    pnl: float = 0.0
+    status: str = "OPEN"
+    holding_period: int = 0
+
+
+# ---------------- Enhanced Backtester ---------------- #
+
+class EnhancedBacktester:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.strategies = []
+        self.trades: List[Trade] = []
+        self.daily_pnl: Dict[str, float] = {}
+        self.portfolio_value = config.get('risk_management', {}).get('account_capital', 500000)
+        self.initial_capital = self.portfolio_value
+        self.load_strategies()
+
+    # -------- Strategy loading -------- #
+
+
+    def load_strategies(self):
+        strategies_config = self.config.get('strategies', {})
+        strategy_classes = {
+            'volatility_breakout': 'VolatilityBreakoutStrategy',
+            'rsi_mean_reversion': 'RSIMeanReversionStrategy',
+            'bollinger_band_reversal': 'BollingerBandReversalStrategy',
+            'moving_average_crossover': 'MovingAverageCrossoverStrategy',
+           # 'test_strategy': 'TestStrategy',
+        }
+
+        for strategy_name, class_name in strategy_classes.items():
+            if strategies_config.get(strategy_name, {}).get('enabled', False):
+                try:
+                    if 'strategies' not in sys.path:
+                        sys.path.insert(0, 'strategies')
+
+                    module = importlib.import_module(strategy_name)
+                    strategy_class = getattr(module, class_name)
+                    strategy_instance = strategy_class(self.config)
+                    self.strategies.append(strategy_instance)
+                    print(f"✅ Loaded strategy: {strategy_name}")
+                except Exception as e:
+                    print(f"❌ Failed to load strategy {strategy_name}: {e}")
+
+    # -------- Helpers -------- #
+
+    def _get_cost_rates(self):
+        bt = self.config.get('backtesting', {})
+        commission = float(bt.get('commission', 0.0))
+        slippage = float(bt.get('slippage', 0.0))
+        return commission, slippage
+
+    def _position_size_from_risk(self, entry_price, stop_loss_price):
+        rm = self.config.get('risk_management', {})
+        capital = float(rm.get('account_capital', self.initial_capital))
+        max_risk_per_trade = float(rm.get('max_risk_per_trade', 0.005))
+        risk_rupees = capital * max_risk_per_trade
+
+        if entry_price <= 0 or stop_loss_price is None or stop_loss_price == entry_price:
+            return 0
+
+        per_share_risk = abs(entry_price - stop_loss_price)
+        if per_share_risk <= 0:
+            return 0
+
+        return int(risk_rupees // per_share_risk)
+
+    def _current_open_portfolio_risk(self, active_trades):
+        capital = self.config.get('risk_management', {}).get('account_capital', self.initial_capital)
+        total_risk = 0.0
+        for t in active_trades:
+            if t.status != 'OPEN':
+                continue
+            if t.signal.signal_type == 'BUY':
+                per_share_risk = max(0.0, t.entry_price - (t.signal.stop_loss or t.entry_price))
+            else:
+                per_share_risk = max(0.0, (t.signal.stop_loss or t.entry_price) - t.entry_price)
+            total_risk += per_share_risk * t.signal.position_size
+        return total_risk / capital if capital else 0.0
+
+    def _daily_loss_limit_hit(self, date_str):
+        rm = self.config.get('risk_management', {})
+        cap = float(rm.get('account_capital', self.initial_capital))
+        max_daily_loss = float(rm.get('max_daily_loss', 0.0))
+        if max_daily_loss <= 0:
+            return False
+        realized_today = self.daily_pnl.get(date_str, 0.0)
+        return realized_today <= -cap * max_daily_loss
+
+    # -------- Market regime -------- #
+
+    def detect_market_regime(self, df, current_idx):
+        if current_idx < 20:
+            return {'regime': 'normal', 'volatility_percentile': 50}
+
+        recent_returns = df['Close'].iloc[current_idx-20:current_idx].pct_change().dropna()
+        volatility = recent_returns.std() * np.sqrt(252)
+
+        if current_idx >= 50:
+            long_vol = df['Close'].iloc[current_idx-50:current_idx].pct_change().rolling(20).std() * np.sqrt(252)
+            vol_percentile = (long_vol.iloc[-1] > long_vol).mean() * 100
+        else:
+            vol_percentile = 50
+
+        regime = 'high_volatility' if vol_percentile > 80 else 'low_volatility' if vol_percentile < 20 else 'normal'
+        return {'regime': regime, 'volatility_percentile': vol_percentile}
+
+    # -------- Trade exit -------- #
+
+    def simulate_realistic_exit(self, trade: Trade, df: pd.DataFrame, current_idx: int):
+        commission_rate, slippage_rate = self._get_cost_rates()
+        current_price = df['Close'].iloc[current_idx]
+        current_time = df.index[current_idx]
+
+        trade.holding_period = (current_time - trade.entry_time).days
+        strategy_config = self.config.get('strategies', {}).get(trade.signal.strategy, {})
+        max_holding_period = int(strategy_config.get('max_holding_period', 5))
+
+        exit_conditions = []
+
+        if trade.signal.signal_type == 'BUY':
+            if current_price <= (trade.signal.stop_loss or -float('inf')):
+                exit_conditions.append(('STOP_LOSS', current_price * (1 - slippage_rate)))
+            elif current_price >= (trade.signal.target_price or float('inf')):
+                exit_conditions.append(('TARGET', current_price * (1 - slippage_rate)))
+        else:
+            if current_price >= (trade.signal.stop_loss or float('inf')):
+                exit_conditions.append(('STOP_LOSS', current_price * (1 + slippage_rate)))
+            elif current_price <= (trade.signal.target_price or -float('inf')):
+                exit_conditions.append(('TARGET', current_price * (1 + slippage_rate)))
+
+        if trade.holding_period >= max_holding_period:
+            adj = (1 - slippage_rate) if trade.signal.signal_type == 'BUY' else (1 + slippage_rate)
+            exit_conditions.append(('TIME_EXIT', current_price * adj))
+
+        if exit_conditions:
+            exit_reason, exit_price = exit_conditions[0]
+            trade.exit_time = current_time
+            trade.exit_price = exit_price
+            trade.exit_reason = exit_reason
+            trade.status = 'CLOSED'
+
+            size = trade.signal.position_size
+            gross_pnl = (exit_price - trade.entry_price) * size if trade.signal.signal_type == 'BUY' else (trade.entry_price - exit_price) * size
+            exit_commission = exit_price * size * commission_rate
+            trade.pnl = gross_pnl - exit_commission
+
+            date_str = current_time.strftime('%Y-%m-%d')
+            self.daily_pnl[date_str] = self.daily_pnl.get(date_str, 0.0) + trade.pnl
+            return True
+
+        return False
+
+    # -------- Backtest loop -------- #
+
+    def run_enhanced_backtest(self, data_dict: Dict[str, pd.DataFrame], start_date=None, end_date=None):
+        print(f"🚀 Starting Enhanced Backtest for {list(data_dict.keys())}")
+
+        self.trades.clear()
+        self.daily_pnl.clear()
+        self.portfolio_value = self.initial_capital
+
+        commission_rate, slippage_rate = self._get_cost_rates()
+
+        for symbol, df in data_dict.items():
+            if start_date and end_date:
+                df = df[(df.index >= start_date) & (df.index <= end_date)]
+
+            df.attrs['symbol'] = symbol
+            print(f"📊 Processing {symbol} with {len(df)} data points")
+
+            active_trades: List[Trade] = []
+
+            for i in range(50, len(df)):
+                current_date = df.index[i]
+                current_data = df.iloc[:i+1]
+
+                # Update active trades
+                for trade in active_trades[:]:
+                    if self.simulate_realistic_exit(trade, df, i):
+                        active_trades.remove(trade)
+                        self.trades.append(trade)
+
+                # New signals
+                market_regime = self.detect_market_regime(df, i)
+
+                for strategy in self.strategies:
+                    try:
+                        signal = strategy.generate_signal(current_data, market_regime)
+
+                        if not signal:
+                            print(f"[{current_date.date()}] {strategy.name} – no signal")
+                            continue
+
+                        print(f"[{current_date.date()}] {strategy.name} – generated {signal.signal_type} signal for {symbol} @ {signal.entry_price:.2f}")
+
+                        # Fill position size if missing
+                        if not signal.position_size or signal.position_size <= 0:
+                            signal.position_size = self._position_size_from_risk(
+                                entry_price=signal.entry_price,
+                                stop_loss_price=signal.stop_loss
+                            )
+
+                        if signal.position_size <= 0:
+                            print(f"[{current_date.date()}] REJECT {signal.strategy} {symbol} – size=0")
+                            continue
+
+                        date_str = current_date.strftime('%Y-%m-%d')
+                        if self._daily_loss_limit_hit(date_str):
+                            print(f"[{date_str}] REJECT {signal.strategy} {symbol} – daily loss cap hit")
+                            continue
+
+                        # Portfolio risk check
+                        max_portfolio_risk = float(self.config.get('risk_management', {}).get('max_portfolio_risk', 0.05))
+                        open_risk = self._current_open_portfolio_risk(active_trades)
+
+                        if signal.signal_type == 'BUY':
+                            per_share_risk = max(0.0, signal.entry_price - (signal.stop_loss or signal.entry_price))
+                        else:
+                            per_share_risk = max(0.0, (signal.stop_loss or signal.entry_price) - signal.entry_price)
+                        candidate_risk = (per_share_risk * signal.position_size) / self.initial_capital
+
+                        if open_risk + candidate_risk > max_portfolio_risk:
+                            print(f"[{date_str}] REJECT {signal.strategy} {symbol} – portfolio risk cap")
+                            continue
+
+                        # Apply entry slippage/commission
+                        raw_entry = signal.entry_price
+                        slipped_entry = raw_entry * (1 + slippage_rate) if signal.signal_type == 'BUY' else raw_entry * (1 - slippage_rate)
+                        notional = slipped_entry * signal.position_size
+                        entry_cost = notional * commission_rate
+
+                        trade = Trade(
+                            signal=signal,
+                            entry_time=current_date,
+                            entry_price=slipped_entry,
+                            status='OPEN'
+                        )
+
+                        self.daily_pnl[date_str] = self.daily_pnl.get(date_str, 0.0) - entry_cost
+                        active_trades.append(trade)
+                        print(f"[{date_str}] ENTER {signal.strategy} {symbol} {signal.signal_type} size={signal.position_size} @ {slipped_entry:.2f}")
+
+                    except Exception as e:
+                        print(f"⚠️ Strategy {strategy.name} error on {symbol}: {e}")
+#                # New signals
+#                market_regime = self.detect_market_regime(df, i)
+#
+#                for strategy in self.strategies:
+#                    try:
+#                        signal = strategy.generate_signal(current_data, market_regime)
+#                        if signal:
+#                            # Fill position size if missing
+#                            if not signal.position_size or signal.position_size <= 0:
+#                                signal.position_size = self._position_size_from_risk(
+#                                    entry_price=signal.entry_price,
+#                                    stop_loss_price=signal.stop_loss
+#                                )
+#
+#                            if signal.position_size <= 0:
+#                                print(f"[{current_date.date()}] REJECT {signal.strategy} {symbol} – size=0")
+#                                continue
+#
+#                            date_str = current_date.strftime('%Y-%m-%d')
+#                            if self._daily_loss_limit_hit(date_str):
+#                                print(f"[{date_str}] REJECT {signal.strategy} {symbol} – daily loss cap hit")
+#                                continue
+#
+#                            # Portfolio risk check
+#                            max_portfolio_risk = float(self.config.get('risk_management', {}).get('max_portfolio_risk', 0.05))
+#                            open_risk = self._current_open_portfolio_risk(active_trades)
+#
+#                            if signal.signal_type == 'BUY':
+#                                per_share_risk = max(0.0, signal.entry_price - (signal.stop_loss or signal.entry_price))
+#                            else:
+#                                per_share_risk = max(0.0, (signal.stop_loss or signal.entry_price) - signal.entry_price)
+#                            candidate_risk = (per_share_risk * signal.position_size) / self.initial_capital
+#
+#                            if open_risk + candidate_risk > max_portfolio_risk:
+#                                print(f"[{date_str}] REJECT {signal.strategy} {symbol} – portfolio risk cap")
+#                                continue
+#
+#                            # Apply entry slippage/commission
+#                            raw_entry = signal.entry_price
+#                            slipped_entry = raw_entry * (1 + slippage_rate) if signal.signal_type == 'BUY' else raw_entry * (1 - slippage_rate)
+#                            notional = slipped_entry * signal.position_size
+#                            entry_cost = notional * commission_rate
+#
+#                            trade = Trade(
+#                                signal=signal,
+#                                entry_time=current_date,
+#                                entry_price=slipped_entry,
+#                                status='OPEN'
+#                            )
+#
+#                            self.daily_pnl[date_str] = self.daily_pnl.get(date_str, 0.0) - entry_cost
+#                            active_trades.append(trade)
+#                            print(f"[{date_str}] ENTER {signal.strategy} {symbol} {signal.signal_type} size={signal.position_size} @ {slipped_entry:.2f}")
+#
+#                    except Exception as e:
+#                        print(f"⚠️ Strategy {strategy.name} error on {symbol}: {e}")
+
+            # Close remaining trades
+            final_raw = df['Close'].iloc[-1]
+            for trade in active_trades:
+                final = final_raw * (1 - slippage_rate) if trade.signal.signal_type == 'BUY' else final_raw * (1 + slippage_rate)
+                trade.exit_time = df.index[-1]
+                trade.exit_price = final
+                trade.exit_reason = 'END_OF_DATA'
+                trade.status = 'CLOSED'
+                size = trade.signal.position_size
+
+                gross = (final - trade.entry_price) * size if trade.signal.signal_type == 'BUY' else (trade.entry_price - final) * size
+                exit_commission = final * size * commission_rate
+                trade.pnl = gross - exit_commission
+
+                date_str = trade.exit_time.strftime('%Y-%m-%d')
+                self.daily_pnl[date_str] = self.daily_pnl.get(date_str, 0.0) + trade.pnl
+
+                self.trades.append(trade)
+
+        print(f"✅ Backtest completed. Generated {len(self.trades)} trades")
+        return self.calculate_performance_metrics()
+
+    # -------- Metrics -------- #
+
+    def calculate_performance_metrics(self):
+        daily_pnl_series = pd.Series(self.daily_pnl).sort_index()
+        if daily_pnl_series.empty:
+            return self.create_empty_results()
+
+        equity = daily_pnl_series.cumsum() + self.initial_capital
+        returns = equity.pct_change().fillna(0.0)
+
+        total_trades = len(self.trades)
+        total_pnl = daily_pnl_series.sum()
+        winning_trades = [t for t in self.trades if t.pnl > 0]
+        losing_trades = [t for t in self.trades if t.pnl < 0]
+
+        gross_profit = sum(t.pnl for t in winning_trades)
+        gross_loss = sum(abs(t.pnl) for t in losing_trades)
+        win_rate = len(winning_trades) / total_trades if total_trades else 0.0
+        avg_win = gross_profit / len(winning_trades) if winning_trades else 0.0
+        avg_loss = gross_loss / len(losing_trades) if losing_trades else 0.0
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+        ann_return = (equity.iloc[-1] / equity.iloc[0]) ** (252 / max(1, len(returns))) - 1
+        ann_vol = returns.std() * np.sqrt(252) if len(returns) > 1 else 0.0
+        sharpe = ann_return / ann_vol if ann_vol > 0 else 0.0
+
+        downside = returns[returns < 0]
+        downside_vol = downside.std() * np.sqrt(252) if len(downside) > 1 else 0.0
+        sortino = ann_return / downside_vol if downside_vol > 0 else 0.0
+
+        rolling_max = equity.cummax()
+        dd = (equity - rolling_max) / rolling_max
+        max_dd_pct = dd.min() if len(dd) else 0.0
+        calmar = ann_return / abs(max_dd_pct) if max_dd_pct < 0 else 0.0
+
+        strategy_performance = {}
+        for strategy in self.strategies:
+            st_trades = [t for t in self.trades if t.signal.strategy == strategy.name]
+            if not st_trades:
+                continue
+            st_pnl = sum(t.pnl for t in st_trades)
+            st_wins = sum(1 for t in st_trades if t.pnl > 0)
+            strategy_performance[strategy.name] = {
+                'total_trades': len(st_trades),
+                'total_pnl': st_pnl,
+                'win_rate': st_wins / len(st_trades),
+                'avg_pnl_per_trade': st_pnl / len(st_trades)
+            }
+
+        return {
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl,
+            'gross_profit': gross_profit,
+            'gross_loss': gross_loss,
+            'profit_factor': profit_factor,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'annual_return_pct': ann_return * 100,
+            'sharpe_ratio': sharpe,
+            'sortino_ratio': sortino,
+            'calmar_ratio': calmar,
+            'max_drawdown_pct': max_dd_pct * 100,
+            'volatility_pct': ann_vol * 100,
+            'strategy_performance': strategy_performance,
+            'daily_pnl': daily_pnl_series.to_dict(),
+            'trades': self.trades
+        }
+
+    def create_empty_results(self):
+        return {
+            'total_trades': 0, 'win_rate': 0, 'total_pnl': 0,
+            'gross_profit': 0, 'gross_loss': 0, 'profit_factor': 0,
+            'avg_win': 0, 'avg_loss': 0, 'annual_return_pct': 0,
+            'sharpe_ratio': 0, 'sortino_ratio': 0, 'calmar_ratio': 0,
+            'max_drawdown_pct': 0, 'volatility_pct': 0,
+            'strategy_performance': {}, 'daily_pnl': {}, 'trades': []
+        }

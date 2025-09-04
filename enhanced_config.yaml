@@ -1,0 +1,57 @@
+backtesting:
+  benchmark: NIFTY
+  commission: 0.001
+  end_date: '2024-12-31'
+  initial_capital: 1000000
+  slippage: 0.0005
+  start_date: '2023-01-01'
+market_data:
+  data_source: angel_one
+  default_symbols:
+  - NIFTY
+  - BANKNIFTY
+  - FINNIFTY
+  history_days: 365
+  update_frequency: daily
+risk_management:
+  account_capital: 1000000
+  kelly_fraction_cap: 0.2
+  max_daily_loss: 0.03
+  max_drawdown: 0.15
+  max_portfolio_risk: 0.05
+  max_risk_per_trade: 0.0055
+  position_sizing_method: fixed_fractional
+strategies:
+  test_strategy:
+    enabled: true
+  bollinger_band_reversal:
+    enabled: true
+    max_holding_period: 5
+    period: 20
+    profit_target_pct: 0.03
+    std_dev: 2.0
+    stop_loss_pct: 0.025
+  moving_average_crossover:
+    enabled: true
+    long_ma: 21
+    max_holding_period: 5
+    profit_target_pct: 0.03
+    short_ma: 8
+    stop_loss_pct: 0.02
+  rsi_mean_reversion:
+    enabled: true
+    max_holding_period: 3
+    overbought_threshold: 70
+    oversold_threshold: 30
+    profit_target_pct: 0.03
+    rsi_period: 14
+    stop_loss_pct: 0.025
+  volatility_breakout:
+    enabled: true
+    lookback_period: 5
+    max_holding_period: 5
+    stop_loss_pct: 0.015
+    target_pct: 0.04
+    vol_threshold: 3.0
+    #volume_threshold: 1.0999999999999999
+    volume_threshold: 1.0

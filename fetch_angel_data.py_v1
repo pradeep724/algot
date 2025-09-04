@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""
+Angel One API Data Fetcher for Indian Algo Trading System
+
+Professional-grade script to fetch historical and live market data 
+from Angel One/Angel Broking API for Indian indices and stocks.
+
+Features:
+- Secure authentication with TOTP support
+- Historical OHLCV data download
+- Multiple timeframes (1min, 5min, 1day, etc.)
+- CSV export functionality
+- Error handling and retry logic
+- Rate limiting compliance
+
+Author: Indian Algo Trading System
+Version: 2.0
+"""
+
+import requests
+import json
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Any
+import time
+import os
+import csv
+import logging
+from dataclasses import dataclass
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class MarketData:
+    """Data structure for market data"""
+    timestamp: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    symbol: str
+
+class AngelOneDataFetcher:
+    """Professional Angel One API client for market data"""
+    
+    def __init__(self, apiKey: str, client_id: str, password: str, totp_secret: Optional[str] = None):
+        self.client_id = client_id
+        self.password = password
+        self.apiKey = apiKey
+        self.totp_secret = totp_secret
+        self.access_token = None
+        self.refresh_token = None
+        self.session = requests.Session()
+        
+        # API endpoints
+        self.base_url = "https://apiconnect.angelbroking.com"
+        self.auth_url = f"{self.base_url}/rest/auth/angelbroking/user/v1/loginByPassword"
+        self.historical_url = f"{self.base_url}/rest/secure/angelbroking/historical/v1/getCandleData"
+        self.ltp_url = f"{self.base_url}/rest/secure/angelbroking/order/v1/getLTP"
+        
+        # Rate limiting
+        self.last_request_time = 0
+        self.min_request_interval = 0.1  # 100ms between requests
+        
+        # Symbol mapping for Indian indices
+        self.index_symbols = {
+            'NIFTY': '99926000',
+            'BANKNIFTY': '99926009', 
+            'FINNIFTY': '99926037',
+            'MIDCPNIFTY': '99926074',
+            'SENSEX': '99919000'
+        }
+        
+    def _rate_limit(self):
+        """Enforce rate limiting between API calls"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        
+        if time_since_last < self.min_request_interval:
+            sleep_time = self.min_request_interval - time_since_last
+            time.sleep(sleep_time)
+        
+        self.last_request_time = time.time()
+    
+    def _generate_totp(self) -> Optional[str]:
+        """Generate TOTP code for 2FA authentication"""
+        if not self.totp_secret:
+            return None
+        
+        try:
+            import pyotp
+            totp = pyotp.TOTP(self.totp_secret)
+            return totp.now()
+        except ImportError:
+            logger.warning("pyotp not installed. TOTP authentication unavailable.")
+            return None
+        except Exception as e:
+            logger.error(f"TOTP generation failed: {e}")
+            return None
+    
+    def authenticate(self) -> bool:
+        """Authenticate with Angel One API"""
+        try:
+            totp_code = self._generate_totp()
+            
+            payload = {
+                "clientcode": self.client_id,
+                "password": self.password
+            }
+            
+            if totp_code:
+                payload["totp"] = totp_code
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-UserType": "USER",
+                "X-SourceID": "WEB",
+                "X-ClientLocalIP": "127.0.0.1",
+                "X-ClientPublicIP": "127.0.0.1",
+                "X-MACAddress": "00:00:00:00:00:00",
+                "X-PrivateKey": self.apiKey
+            }
+            
+            self._rate_limit()
+            response = self.session.post(self.auth_url, json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get("status"):
+                    auth_data = data.get("data", {})
+                    self.access_token = auth_data.get("jwtToken")
+                    self.refresh_token = auth_data.get("refreshToken")
+                    
+                    # Update session headers
+                    self.session.headers.update({
+                        "Authorization": f"Bearer {self.access_token}",
+                        "Content-Type": "application/json"
+                    })
+                    
+                    logger.info("✅ Authentication successful")
+                    return True
+                else:
+                    logger.error(f"❌ Authentication failed: {data.get('message')}")
+                    return False
+            else:
+                logger.error(f"❌ HTTP error during authentication: {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Authentication exception: {e}")
+            return False
+    
+    def get_symbol_token(self, symbol: str, exchange: str = "NSE") -> Optional[str]:
+        """Get symbol token for API calls"""
+        
+        # Check if it's a known index
+        if symbol.upper() in self.index_symbols:
+            return self.index_symbols[symbol.upper()]
+        
+        # For individual stocks, you might need to implement symbol lookup
+        # This is a simplified implementation
+        logger.warning(f"Symbol token lookup not implemented for {symbol}")
+        return None
+    
+    def fetch_historical_data(
+        self, 
+        symbol: str, 
+        start_date: str, 
+        end_date: str, 
+        interval: str = "ONE_DAY",
+        exchange: str = "NSE"
+    ) -> List[MarketData]:
+        """
+        Fetch historical OHLCV data
+        
+        Args:
+            symbol: Symbol name (e.g., 'NIFTY', 'RELIANCE')
+            start_date: Start date in 'YYYY-MM-DD' format
+            end_date: End date in 'YYYY-MM-DD' format  
+            interval: Data interval ('ONE_MINUTE', 'FIVE_MINUTE', 'ONE_DAY', etc.)
+            exchange: Exchange name ('NSE', 'BSE')
+        
+        Returns:
+            List of MarketData objects
+        """
+        
+        if not self.access_token:
+            raise RuntimeError("Not authenticated. Call authenticate() first.")
+        
+        symbol_token = self.get_symbol_token(symbol, exchange)
+        if not symbol_token:
+            logger.error(f"Could not find symbol token for {symbol}")
+            return []
+        
+        try:
+            payload = {
+                "exchange": exchange,
+                "symboltoken": symbol_token,
+                "interval": interval,
+                "fromdate": f"{start_date} 09:15",
+                "todate": f"{end_date} 15:30"
+            }
+            
+            headers = {
+              "Authorization": f"Bearer {self.access_token}",
+              "Content-Type": "application/json",
+              "Accept": "application/json",
+              "X-UserType": "USER",
+              "X-SourceID": "WEB",
+              "X-ClientLocalIP": "127.0.0.1",
+              "X-ClientPublicIP": "127.0.0.1",
+              "X-MACAddress": "00:00:00:00:00:00",
+              "X-PrivateKey": self.apiKey
+            }
+            self._rate_limit()
+            response = self.session.post(self.historical_url, json=payload,headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get("status") and data.get("data"):
+                    candles = data["data"]
+                    
+                    market_data = []
+                    for candle in candles:
+                        try:
+                            market_data.append(MarketData(
+                                timestamp=datetime.strptime(candle[0], '%Y-%m-%dT%H:%M:%S%z'),
+                                open=float(candle[1]),
+                                high=float(candle[2]), 
+                                low=float(candle[3]),
+                                close=float(candle[4]),
+                                volume=int(candle[5]),
+                                symbol=symbol
+                            ))
+                        except (ValueError, IndexError) as e:
+                            logger.warning(f"Skipping malformed candle  {e}")
+                            continue
+                    
+                    logger.info(f"✅ Fetched {len(market_data)} records for {symbol}")
+                    return market_data
+                    
+                else:
+                    logger.error(f"API error: {data.get('message', 'Unknown error')}")
+                    return []
+                    
+            else:
+                logger.error(f"HTTP error {response.status_code}: {response.text}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Exception while fetching data for {symbol}: {e}")
+            return []
+    
+    def get_live_price(self, symbol: str, exchange: str = "NSE") -> Optional[float]:
+        """Get current live price for a symbol"""
+        
+        if not self.access_token:
+            raise RuntimeError("Not authenticated. Call authenticate() first.")
+        
+        symbol_token = self.get_symbol_token(symbol, exchange)
+        if not symbol_token:
+            return None
+        
+        try:
+            payload = {
+                "exchange": exchange,
+                "tradingsymbol": symbol,
+                "symboltoken": symbol_token
+            }
+            
+            self._rate_limit()
+            response = self.session.post(self.ltp_url, json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") and data.get("data"):
+                    return float(data["data"]["ltp"])
+            
+            logger.error(f"Failed to get live price for {symbol}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Exception getting live price for {symbol}: {e}")
+            return None
+    
+    def save_to_csv(self, market_: List[MarketData], filename: str):
+      """Save market data to CSV file"""
+      if not market_:
+        print("⚠️ No data to save.")
+        return
+
+      try:
+        # Convert MarketData objects to dictionary```rmat
+        csv_data = []
+        for data in market_:
+            csv_data.append({
+                'timestamp': data.timestamp,
+                'open': data.open,
+                'high': data.high,
+                'low': data.low,
+                'close': data.close,
+                'volume': data.volume,
+                'symbol': data.symbol
+            })
+        
+        # Save to CSV using pandas
+        df = pd.DataFrame(csv_data)
+        df.to_csv(filename, index=False)
+        print(f"✅ Data saved to {filename}")
+        
+      except Exception as e:
+        print(f"❌ Failed to save data to CSV: {e}")
+
+   
+    #def save_to_algo_format(self, market_: List[MarketData], filename: str):
+    def save_to_algo_format(self, market_data, filename: str):
+        """Save in format compatible with algo trading system"""
+        
+        if not market_data:
+            logger.warning("No data to save")
+            return
+        
+        try:
+            # Format compatible with your algo system
+            df_data = []
+            for data in market_data:
+                df_data.append({
+                    'Timestamp': data.timestamp,
+                    'Open': data.open,
+                    'High': data.high,
+                    'Low': data.low,
+                    'Close': data.close,
+                    'Volume': data.volume
+                })
+            
+            df = pd.DataFrame(df_data)
+            df.set_index('Timestamp', inplace=True)
+            df.attrs['symbol'] = market_data[0].symbol if market_data else 'UNKNOWN'
+            df.attrs['source'] = 'AngelOne'
+            df.attrs['fetch_time'] = datetime.now()
+            
+            # Save as pickle for preserving attributes
+            df.to_pickle(filename.replace('.csv', '.pkl'))
+            # Also save as CSV
+            df.to_csv(filename)
+            
+            logger.info(f"✅ Algo-compatible data saved to {filename}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save algo format  {e}")
+
+def main():
+    """Main function with example usage"""
+    
+    # Load credentials from environment variables
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        logger.warning("python-dotenv not found. Using environment variables directly.")
+    
+    CLIENT_ID = os.getenv('ANGEL_CLIENT_ID')
+    API_KEY = os.getenv('ANGEL_API_KEY')
+    PASSWORD = os.getenv('ANGEL_PASSWORD') 
+    TOTP_SECRET = os.getenv('ANGEL_TOTP_SECRET')  # Optional
+    
+    if not CLIENT_ID or not PASSWORD:
+        logger.error("❌ Please set ANGEL_CLIENT_ID and ANGEL_PASSWORD environment variables")
+        logger.info("Create a .env file with:")
+        logger.info("ANGEL_CLIENT_ID=your_client_id")
+        logger.info("ANGEL_PASSWORD=your_password")
+        logger.info("ANGEL_TOTP_SECRET=your_totp_secret  # Optional")
+        return
+    
+    # Initialize fetcher
+    fetcher = AngelOneDataFetcher(API_KEY,CLIENT_ID, PASSWORD, TOTP_SECRET)
+    
+    # Authenticate
+    if not fetcher.authenticate():
+        logger.error("❌ Authentication failed. Exiting.")
+        return
+    
+    # Example: Fetch data for multiple indices
+    indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY']
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+    
+    logger.info(f"📊 Fetching data from {start_date} to {end_date}")
+    
+    for symbol in indices:
+        logger.info(f"🔍 Fetching {symbol} data...")
+        
+        try:
+            # Fetch historical data
+            data = fetcher.fetch_historical_data(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                interval="ONE_DAY"
+            )
+            
+            if data:
+                # Save in multiple formats
+                csv_filename = f"data/{symbol}_{start_date}_to_{end_date}.csv"
+                algo_filename = f"data/{symbol}_{start_date}_to_{end_date}_algo.csv"
+                
+                # Create data directory if it doesn't exist
+                os.makedirs('data', exist_ok=True)
+                
+                fetcher.save_to_csv(data, csv_filename)
+                fetcher.save_to_algo_format(data, algo_filename)
+                
+                # Get current live price
+                live_price = fetcher.get_live_price(symbol)
+                if live_price:
+                    logger.info(f"💹 {symbol} current price: ₹{live_price:,.2f}")
+            
+            # Small delay between symbols
+            time.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch data for {symbol}: {e}")
+    
+    logger.info("✅ Data fetching completed")
+
+if __name__ == "__main__":
+    main()

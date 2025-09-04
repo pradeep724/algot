@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""
+Enhanced Algo Trading System with Data Management
+- Load existing historical CSV files
+- Fetch new data from Angel One API
+- Run backtests with either data source
+- Interactive Streamlit GUI
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yaml
+import os
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Configure Streamlit
+st.set_page_config(
+    page_title="Enhanced Algo Trading System",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Import your modules (make sure these files exist)
+try:
+    from fetch_angel_data import AngelOneDataFetcher
+    from enhanced_backtesting import EnhancedBacktester
+    from sample_data import EnhancedSampleDataGenerator
+    from strategy_analyzer import StrategyAnalyzer
+    MODULES_AVAILABLE = True
+except ImportError as e:
+    st.error(f"Missing modules: {e}")
+    MODULES_AVAILABLE = False
+
+# Constants
+DATA_DIR = Path("historical_data")
+DATA_DIR.mkdir(exist_ok=True)
+
+@st.cache_data
+def load_config():
+    """Load configuration from YAML file"""
+    try:
+        with open('enhanced_config.yaml', 'r') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        st.error("Configuration file 'enhanced_config.yaml' not found!")
+        return {}
+
+@st.cache_data
+def get_available_data_files():
+    """Get list of available historical data files"""
+    files = list(DATA_DIR.glob("*_historical.csv"))
+    symbols = [f.stem.replace('_historical', '') for f in files]
+    return symbols, files
+
+@st.cache_data
+def load_historical_data(symbol):
+    """Load historical data from CSV file"""
+    filepath = DATA_DIR / f"{symbol}_historical.csv"
+    
+    if filepath.exists():
+        try:
+            df = pd.read_csv(filepath, index_col='Timestamp', parse_dates=True)
+            df.attrs['symbol'] = symbol
+            df.attrs['source'] = 'CSV'
+            df.attrs['loaded_at'] = datetime.now()
+            return df
+        except Exception as e:
+            st.error(f"Error loading {symbol}: {e}")
+            return None
+    return None
+
+def fetch_fresh_data(symbols, start_date, end_date, credentials):
+    """Fetch fresh data using Angel One API"""
+    if not MODULES_AVAILABLE:
+        st.error("Data fetching modules not available")
+        return {}
+    
+    try:
+        # Initialize fetcher
+        fetcher = AngelOneDataFetcher(
+            credentials['client_id'],
+            credentials['password'],
+            credentials.get('totp_secret'),
+            credentials.get('api_key')
+        )
+        
+        # Authenticate
+        if not fetcher.authenticate():
+            st.error("❌ Authentication failed")
+            return {}
+        
+        # Fetch data for each symbol
+        data = {}
+        progress_bar = st.progress(0)
+        
+        for i, symbol in enumerate(symbols):
+            st.write(f"🔍 Fetching {symbol}...")
+            
+            df = fetcher.fetch_and_update_historical_data(
+                symbol=symbol,
+                start_date=start_date.strftime('%Y-%m-%d'),
+                end_date=end_date.strftime('%Y-%m-%d')
+            )
+            
+            if not df.empty:
+                data[symbol] = df
+                st.success(f"✅ {symbol}: {len(df)} records")
+            else:
+                st.warning(f"⚠️ No data for {symbol}")
+            
+            progress_bar.progress((i + 1) / len(symbols))
+            time.sleep(0.5)  # Rate limiting
+        
+        return data
+        
+    except Exception as e:
+        st.error(f"❌ Data fetching error: {e}")
+        return {}
+
+def create_performance_chart(df, symbol):
+    """Create interactive price chart"""
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.7, 0.3],
+        subplot_titles=(f'{symbol} Price Chart', 'Volume')
+    )
+    
+    # Candlestick chart
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df['Open'],
+            high=df['High'],
+            low=df['Low'],
+            close=df['Close'],
+            name=symbol
+        ),
+        row=1, col=1
+    )
+    
+    # Volume chart
+    fig.add_trace(
+        go.Bar(
+            x=df.index,
+            y=df['Volume'],
+            name='Volume',
+            marker_color='lightblue'
+        ),
+        row=2, col=1
+    )
+    
+    fig.update_layout(
+        height=600,
+        showlegend=False,
+        xaxis_rangeslider_visible=False
+    )
+    
+    return fig
+
+def run_backtest(data, config):
+    """Run backtest with provided data"""
+    if not MODULES_AVAILABLE:
+        st.error("Backtesting modules not available")
+        return None
+    
+    try:
+        backtester = EnhancedBacktester(config)
+        
+        with st.spinner("🚀 Running backtest..."):
+            results = backtester.run_enhanced_backtest(data)
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"❌ Backtest error: {e}")
+        return None
+
+def display_backtest_results(results):
+    """Display comprehensive backtest results"""
+    if not results:
+        return
+    
+    st.header("📊 Backtest Results")
+    
+    # Key metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Trades", results['total_trades'])
+    with col2:
+        st.metric("Win Rate", f"{results['win_rate']*100:.1f}%")
+    with col3:
+        st.metric("Total P&L", f"₹{results['total_pnl']:,.2f}")
+    with col4:
+        st.metric("Sharpe Ratio", f"{results['sharpe_ratio']:.2f}")
+    
+    # Performance chart
+    if 'daily_pnl' in results and results['daily_pnl']:
+        daily_pnl = pd.Series(results['daily_pnl']).sort_index()
+        cumulative_pnl = daily_pnl.cumsum()
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=cumulative_pnl.index,
+            y=cumulative_pnl.values,
+            mode='lines',
+            name='Cumulative P&L',
+            line=dict(color='green', width=2)
+        ))
+        
+        fig.update_layout(
+            title="Cumulative P&L Over Time",
+            xaxis_title="Date",
+            yaxis_title="P&L (₹)",
+            height=400
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Strategy performance
+    if 'strategy_performance' in results:
+        st.subheader("🎯 Strategy Performance")
+        
+        strategy_data = []
+        for strategy, metrics in results['strategy_performance'].items():
+            strategy_data.append({
+                'Strategy': strategy.replace('_', ' ').title(),
+                'Trades': metrics.get('total_trades', 0),
+                'Win Rate (%)': f"{metrics.get('win_rate', 0)*100:.1f}",
+                'P&L (₹)': f"{metrics.get('total_pnl', 0):,.2f}",
+                'Avg P&L/Trade': f"₹{metrics.get('avg_pnl_per_trade', 0):.2f}"
+            })
+        
+        if strategy_data:
+            df_strategies = pd.DataFrame(strategy_data)
+            st.dataframe(df_strategies, use_container_width=True)
+
+def main():
+    """Main application function"""
+    
+    st.title("📈 Enhanced Algo Trading System")
+    st.markdown("*Professional trading system with data management and backtesting*")
+    
+    # Sidebar configuration
+    st.sidebar.header("🔧 Configuration")
+    
+    # Data source selection
+    data_source = st.sidebar.radio(
+        "Select Data Source",
+        ["📂 Load Existing CSV Files", "🔄 Fetch Fresh Data", "🎲 Generate Sample Data"]
+    )
+    
+    # Get available symbols
+    available_symbols, _ = get_available_data_files()
+    all_symbols = list(set(available_symbols + ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']))
+    
+    # Symbol selection
+    selected_symbols = st.sidebar.multiselect(
+        "Select Symbols",
+        sorted(all_symbols),
+        default=['NIFTY'] if 'NIFTY' in all_symbols else all_symbols[:1]
+    )
+    
+    # Date range
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        start_date = st.date_input(
+            "Start Date",
+            datetime.now() - timedelta(days=365)
+        )
+    with col2:
+        end_date = st.date_input("End Date", datetime.now())
+    
+    # Load configuration
+    config = load_config()
+    
+    # Main content tabs
+    tab1, tab2, tab3 = st.tabs(["📊 Data Management", "🚀 Backtesting", "⚙️ Configuration"])
+    
+    with tab1:
+        st.header("📊 Data Management")
+        
+        data = {}
+        
+        if data_source == "📂 Load Existing CSV Files":
+            st.subheader("Loading Historical CSV Files")
+            
+            for symbol in selected_symbols:
+                df = load_historical_data(symbol)
+                if df is not None:
+                    data[symbol] = df
+                    
+                    with st.expander(f"📈 {symbol} - {len(df)} records"):
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Records", len(df))
+                        with col2:
+                            st.metric("Date Range", f"{df.index.min().date()} to {df.index.max().date()}")
+                        with col3:
+                            st.metric("Latest Close", f"₹{df['Close'].iloc[-1]:,.2f}")
+                        
+                        # Show chart
+                        chart = create_performance_chart(df, symbol)
+                        st.plotly_chart(chart, use_container_width=True)
+                else:
+                    st.warning(f"⚠️ No data file found for {symbol}")
+        
+        elif data_source == "🔄 Fetch Fresh Data":
+            st.subheader("Fetch Fresh Data from Angel One API")
+            
+            # Credentials input
+            with st.expander("🔐 API Credentials", expanded=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    client_id = st.text_input("Client ID", type="password")
+                    totp_secret = st.text_input("TOTP Secret (Optional)", type="password")
+                with col2:
+                    password = st.text_input("Password", type="password")
+                    api_key = st.text_input("API Key", type="password")
+            
+            if st.button("🚀 Fetch Data", type="primary"):
+                if client_id and password:
+                    credentials = {
+                        'client_id': client_id,
+                        'password': password,
+                        'totp_secret': totp_secret if totp_secret else None,
+                        'api_key': api_key if api_key else None
+                    }
+                    
+                    data = fetch_fresh_data(selected_symbols, start_date, end_date, credentials)
+                    
+                    if data:
+                        st.success(f"✅ Successfully fetched data for {len(data)} symbols")
+                        st.session_state['fetched_data'] = data
+                else:
+                    st.error("❌ Please provide Client ID and Password")
+            
+            # Show previously fetched data
+            if 'fetched_data' in st.session_state:
+                data = st.session_state['fetched_data']
+                st.subheader("📈 Fetched Data Summary")
+                for symbol, df in data.items():
+                    st.write(f"**{symbol}**: {len(df)} records from {df.index.min().date()} to {df.index.max().date()}")
+        
+        elif data_source == "🎲 Generate Sample Data":
+            st.subheader("Generate Sample Data for Testing")
+            
+            days = st.slider("Number of Days", 100, 1000, 365)
+            
+            if st.button("🎲 Generate Sample Data", type="primary"):
+                if MODULES_AVAILABLE:
+                    generator = EnhancedSampleDataGenerator()
+                    
+                    with st.spinner("Generating sample data..."):
+                        data = generator.generate_multiple_indices(selected_symbols, days)
+                    
+                    st.success(f"✅ Generated {days} days of data for {len(selected_symbols)} symbols")
+                    st.session_state['sample_data'] = data
+                else:
+                    st.error("❌ Sample data generator not available")
+            
+            # Show previously generated data
+            if 'sample_data' in st.session_state:
+                data = st.session_state['sample_data']
+                st.subheader("📊 Generated Data Summary")
+                for symbol, df in data.items():
+                    st.write(f"**{symbol}**: {len(df)} records")
+        
+        # Store data in session state
+        if data:
+            st.session_state['current_data'] = data
+    
+    with tab2:
+        st.header("🚀 Backtesting")
+        
+        # Get data from session state
+        data = st.session_state.get('current_data', {})
+        
+        if not data:
+            st.warning("⚠️ No data available. Please load or fetch data first.")
+        else:
+            st.subheader("📊 Available Data")
+            for symbol, df in data.items():
+                st.write(f"**{symbol}**: {len(df)} records")
+            
+            # Strategy selection
+            if config and 'strategies' in config:
+                st.subheader("🎯 Strategy Configuration")
+                
+                strategies = config['strategies']
+                enabled_strategies = []
+                
+                for strategy_name, strategy_config in strategies.items():
+                    enabled = st.checkbox(
+                        f"{strategy_name.replace('_', ' ').title()}",
+                        value=strategy_config.get('enabled', False)
+                    )
+                    if enabled:
+                        enabled_strategies.append(strategy_name)
+                
+                # Update config with selected strategies
+                for strategy_name in strategies:
+                    config['strategies'][strategy_name]['enabled'] = strategy_name in enabled_strategies
+                
+                # Run backtest
+                if st.button("🚀 Run Backtest", type="primary"):
+                    if enabled_strategies:
+                        results = run_backtest(data, config)
+                        if results:
+                            st.session_state['backtest_results'] = results
+                    else:
+                        st.warning("⚠️ Please select at least one strategy")
+            
+            # Display results
+            if 'backtest_results' in st.session_state:
+                display_backtest_results(st.session_state['backtest_results'])
+    
+    with tab3:
+        st.header("⚙️ Configuration")
+        
+        if config:
+            st.subheader("📋 Current Configuration")
+            
+            # Risk Management
+            with st.expander("🛡️ Risk Management"):
+                risk_config = config.get('risk_management', {})
+                st.json(risk_config)
+            
+            # Strategy Parameters
+            with st.expander("🎯 Strategy Parameters"):
+                strategies_config = config.get('strategies', {})
+                for strategy_name, strategy_config in strategies_config.items():
+                    st.subheader(f"{strategy_name.replace('_', ' ').title()}")
+                    st.json(strategy_config)
+        
+        # File management
+        st.subheader("📁 File Management")
+        
+        if st.button("🗑️ Clear All Data"):
+            if st.button("⚠️ Confirm Clear All Data"):
+                st.session_state.clear()
+                st.success("✅ All data cleared")
+                st.experimental_rerun()
+
+if __name__ == "__main__":
+    main()
